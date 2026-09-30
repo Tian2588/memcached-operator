@@ -40,8 +40,7 @@ spec:
             description: spec defines the desired state of Memcached
             properties:
               size:
-                description: foo is an example field of Memcached. Edit memcached_types.go
-                  to remove/update
+                description: Size is the number of Memcached replicas to run.
                 format: int32
                 minimum: 1
                 type: integer

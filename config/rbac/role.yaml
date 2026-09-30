@@ -7,10 +7,14 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
+  - configmaps
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - apps

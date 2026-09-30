@@ -18,7 +18,6 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -31,9 +30,8 @@ type MemcachedSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	// foo is an example field of Memcached. Edit memcached_types.go to remove/update
-	// +optional
-	// +kubebuilder:validation:Minimum:=1
+	// Size is the number of Memcached replicas to run.
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Required
 	Size int32 `json:"size"`
 }
@@ -97,8 +95,5 @@ type MemcachedList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(func(s *runtime.Scheme) error {
-		s.AddKnownTypes(SchemeGroupVersion, &Memcached{}, &MemcachedList{})
-		return nil
-	})
+	SchemeBuilder.Register(&Memcached{}, &MemcachedList{})
 }
