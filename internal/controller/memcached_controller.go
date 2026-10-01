@@ -18,17 +18,21 @@ package controller
 
 import (
 	"context"
-	"slices"
+	"fmt"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/Tian2588/memcached-operator/api/v1alpha1"
@@ -37,10 +41,11 @@ import (
 const (
 	TypeAvailable   = "Available"
 	TypeProgressing = "Progressing"
+	memcachedImage  = "memcached:1.6.26-alpine"
+	memcachedPort   = 11211
+	// 新增Finalizer标识
+	memcachedFinalizer = "cache.example.com/finalizer"
 )
-
-// 子资源finalizer常量
-const subResourceFinalizer = "finalizer.cache.example.com/subresource"
 
 // MemcachedReconciler reconciles a Memcached object
 type MemcachedReconciler struct {
@@ -52,132 +57,187 @@ type MemcachedReconciler struct {
 // +kubebuilder:rbac:groups=cache.example.com,resources=memcacheds/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cache.example.com,resources=memcacheds/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Memcached object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
 func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// 1. 获取Memcached CR实例
 	memcached := &cachev1alpha1.Memcached{}
 	if err := r.Get(ctx, req.NamespacedName, memcached); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("Memcached resource not found, ignore")
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to fetch Memcached")
 		return ctrl.Result{}, err
 	}
 
-	// 子资源(ConfigMap)的finalizer清理逻辑
-	subName := types.NamespacedName{Name: memcached.Name + "-sub", Namespace: memcached.Namespace}
-	sub := &corev1.ConfigMap{}
-	subErr := r.Get(ctx, subName, sub)
-	if subErr == nil && sub.DeletionTimestamp != nil {
-		logger.Info("Subresource is deleting", "name", subName)
-		// 子资源正在被删除，且带finalizer → 卡住
-		if slices.Contains(sub.Finalizers, subResourceFinalizer) {
-			logger.Info("Subresource is deleting, stucking 30 seconds...")
-			time.Sleep(30 * time.Second)
-
-			// 清理完成，移除finalizer，子资源才会被GC真正删除
-			sub.Finalizers = removeString(sub.Finalizers, subResourceFinalizer)
-			if err := r.Update(ctx, sub); err != nil {
-				logger.Error(err, "Failed to remove finalizer of the subresource")
+	if memcached.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(memcached, memcachedFinalizer) {
+			controllerutil.AddFinalizer(memcached, memcachedFinalizer)
+			if err := r.Update(ctx, memcached); err != nil {
+				logger.Error(err, "Failed to add finalizer")
 				return ctrl.Result{}, err
 			}
-			logger.Info("Succeeded to remove finalizer of the subresource")
 		}
+	} else {
+		// 父资源正在删除，执行清理逻辑
+		if controllerutil.ContainsFinalizer(memcached, memcachedFinalizer) {
+			logger.Info("Memcached CR is deleting, run cleanup logic")
+			// 👉 这里可以放额外自定义清理逻辑（例如清理外部资源、自定义ConfigMap等）
+			// test
+			time.Sleep(15 * time.Second)
+			logger.Info("Waiting for 15 seconds...")
+			// Deployment 依靠OwnerReference由K8s GC自动回收，不需要手动Delete
+			cm := &corev1.ConfigMap{}
+			err := r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, cm)
+			if err == nil {
+				// 存在ConfigMap，则删除
+				if err := r.Delete(ctx, cm); err != nil {
+					logger.Error(err, "Failed to delete configmap during finalizer cleanup")
+					return ctrl.Result{}, err
+				}
+				logger.Info("ConfigMap deleted successfully")
+			} else if !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to get configmap for cleanup")
+				return ctrl.Result{}, err
+			}
+
+			// 清理完成，移除finalizer，父资源才允许被删除
+			latestMem := &cachev1alpha1.Memcached{}
+			if err := r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, latestMem); err != nil {
+				logger.Error(err, "Failed to fetch latest memcached before remove finalizer")
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(latestMem, memcachedFinalizer)
+			if err := r.Update(ctx, latestMem); err != nil {
+				logger.Error(err, "Failed to remove finalizer")
+				return ctrl.Result{}, err
+			}
+			logger.Info("Finalizer removed, memcached CR can be deleted")
+		}
+		// finalizer移除后直接返回，不再创建/更新Deployment
 		return ctrl.Result{}, nil
-	} else if subErr != nil && !errors.IsNotFound(subErr) {
-		return ctrl.Result{}, subErr
 	}
 
-	// 2. 查询对应的Deployment
-	dep := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, dep)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// Deployment不存在，新建
-			dep = r.newDeploymentForMemcached(memcached)
-			logger.Info("Creating Deployment", "name", dep.Name)
-			if err = r.Create(ctx, dep); err != nil {
-				logger.Error(err, "Failed to create Deployment")
-				r.setCondition(memcached, TypeProgressing, metav1.ConditionFalse, "CreateFailed", "Create deployment failed")
-				_ = r.Status().Update(ctx, memcached)
-				return ctrl.Result{}, err
-			}
-			// 设置状态：正在创建
-			r.setCondition(memcached, TypeProgressing, metav1.ConditionTrue, "Created", "Deployment created, waiting pods ready")
-			_ = r.Status().Update(ctx, memcached)
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-		logger.Error(err, "Failed get Deployment")
-		return ctrl.Result{}, err
-	}
-
-	// 3. 副本数不一致，扩容/缩容
-	wantSize := memcached.Spec.Size
-	if *dep.Spec.Replicas != wantSize {
-		logger.Info("Updating Deployment", "name", dep.Name)
-		dep.Spec.Replicas = &wantSize
-		if err = r.Update(ctx, dep); err != nil {
-			logger.Error(err, "Update deployment replicas failed")
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, cm)
+	if err != nil && errors.IsNotFound(err) {
+		cm, err = r.newConfigMapForMemcached(ctx, memcached)
+		if err != nil {
+			logger.Error(err, "Failed to build configmap")
 			return ctrl.Result{}, err
 		}
-		r.setCondition(memcached, TypeProgressing, metav1.ConditionTrue, "Scaling", "Scaling replicas")
-		_ = r.Status().Update(ctx, memcached)
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-	// 确保子资源ConfigMap存在（不存在则创建）
-	if subErr != nil {
-		if errors.IsNotFound(subErr) {
-			logger.Info("Subresource not found, creating...")
-			newSub := r.newSubResourceForMemcached(memcached)
-			if err := r.Create(ctx, newSub); err != nil {
-				logger.Error(err, "Failed to create subresource")
-				return ctrl.Result{}, err
-			}
-			logger.Info("Succeeded to create ConfigMap（BlockOwnerDeletion=true + finalizer）")
-		} else {
-			logger.Error(subErr, "Failed to fetch subresource")
-			return ctrl.Result{}, subErr
+		logger.Info("Creating ConfigMap", "name", cm.Name)
+		if err = r.Create(ctx, cm); err != nil {
+			logger.Error(err, "Failed to create configmap")
+			return ctrl.Result{}, err
 		}
-	}
-
-	// 4. 更新就绪副本状态
-	memcached.Status.ReadyReplicas = dep.Status.ReadyReplicas
-
-	// 5. 更新Conditions
-	if dep.Status.ReadyReplicas == wantSize {
-		r.setCondition(memcached, TypeAvailable, metav1.ConditionTrue, "Ready", "All replicas ready")
-		r.setCondition(memcached, TypeProgressing, metav1.ConditionFalse, "Completed", "All replicas ready")
-	} else {
-		r.setCondition(memcached, TypeAvailable, metav1.ConditionFalse, "Pending", "Waiting for pods ready")
-		r.setCondition(memcached, TypeProgressing, metav1.ConditionTrue, "Waiting", "Pods not fully ready")
-	}
-
-	// 提交Status更新
-	if err = r.Status().Update(ctx, memcached); err != nil {
-		logger.Error(err, "Update status error")
+	} else if err != nil {
+		logger.Error(err, "Failed to get configmap")
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	dep := &appsv1.Deployment{}
+	err = r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, dep)
+	if err != nil && errors.IsNotFound(err) {
+		dep, err = r.newDeploymentForMemcached(ctx, memcached)
+		if err != nil {
+			logger.Error(err, "Failed to define Deployment for Memcached")
+			if statusErr := r.patchStatus(ctx, memcached, nil, metav1.Condition{
+				Type: TypeProgressing, Status: metav1.ConditionFalse, Reason: "CreateFailed", Message: err.Error(),
+			}); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{}, err
+		}
+		logger.Info("Creating Deployment", "name", dep.Name)
+		if err = r.Create(ctx, dep); err != nil {
+			logger.Error(err, "Failed to create Deployment")
+			if statusErr := r.patchStatus(ctx, memcached, dep, metav1.Condition{
+				Type: TypeProgressing, Status: metav1.ConditionFalse, Reason: "CreateFailed", Message: "Failed to create Deployment",
+			}); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.patchStatus(ctx, memcached, dep, metav1.Condition{
+			Type: TypeProgressing, Status: metav1.ConditionTrue, Reason: "Created", Message: "Deployment created, waiting for Pods to become ready",
+		})
+	} else if err != nil {
+		logger.Error(err, "Failed to get Deployment")
+		return ctrl.Result{}, err
+	}
+
+	if needsUpdate(dep, memcached.Spec.Size) {
+		logger.Info("Updating Deployment", "name", dep.Name)
+		size := memcached.Spec.Size
+		dep.Spec.Replicas = &size
+		if len(dep.Spec.Template.Spec.Containers) > 0 {
+			dep.Spec.Template.Spec.Containers[0].Image = memcachedImage
+		}
+		if err = r.Update(ctx, dep); err != nil {
+			logger.Error(err, "Failed to update Deployment replicas")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.patchStatus(ctx, memcached, dep, metav1.Condition{
+			Type: TypeProgressing, Status: metav1.ConditionTrue, Reason: "Scaling", Message: "Scaling replicas",
+		})
+	}
+
+	if dep.Status.ReadyReplicas == memcached.Spec.Size {
+		return ctrl.Result{}, r.patchStatus(ctx, memcached, dep,
+			metav1.Condition{Type: TypeAvailable, Status: metav1.ConditionTrue, Reason: "Ready", Message: "All replicas ready"},
+			metav1.Condition{Type: TypeProgressing, Status: metav1.ConditionFalse, Reason: "Completed", Message: "All replicas ready"},
+		)
+	}
+
+	return ctrl.Result{}, r.patchStatus(ctx, memcached, dep,
+		metav1.Condition{Type: TypeAvailable, Status: metav1.ConditionFalse, Reason: "Pending", Message: "Waiting for Pods to become ready"},
+		metav1.Condition{Type: TypeProgressing, Status: metav1.ConditionTrue, Reason: "Waiting", Message: "Pods not fully ready"},
+	)
 }
 
-// newDeploymentForMemcached 构造Deployment对象
-func (r *MemcachedReconciler) newDeploymentForMemcached(m *cachev1alpha1.Memcached) *appsv1.Deployment {
+func needsUpdate(dep *appsv1.Deployment, wantSize int32) bool {
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != wantSize {
+		return true
+	}
+	if len(dep.Spec.Template.Spec.Containers) == 0 {
+		return false
+	}
+	return dep.Spec.Template.Spec.Containers[0].Image != memcachedImage
+}
+
+func (r *MemcachedReconciler) patchStatus(ctx context.Context, m *cachev1alpha1.Memcached, dep *appsv1.Deployment, conditions ...metav1.Condition) error {
+	// 先拷贝当前传入对象作为patch基准
+	base := m.DeepCopy()
+
+	if dep != nil {
+		m.Status.ReadyReplicas = dep.Status.ReadyReplicas
+	}
+	for _, cond := range conditions {
+		cond.ObservedGeneration = m.Generation
+		meta.SetStatusCondition(&m.Status.Conditions, cond)
+	}
+
+	// MergeFrom 只提交差异部分，增量patch status
+	patch := client.MergeFrom(base)
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to patch Memcached status")
+		return err
+	}
+	return nil
+}
+
+// newDeploymentForMemcached constructs a Deployment owned by the Memcached CR.
+func (r *MemcachedReconciler) newDeploymentForMemcached(ctx context.Context, m *cachev1alpha1.Memcached) (*appsv1.Deployment, error) {
+	var memcached = "memcached"
 	labels := map[string]string{
-		"app":          "memcached",
+		"app":          memcached,
 		"memcached_cr": m.Name,
 	}
 	replicas := m.Spec.Size
@@ -198,10 +258,34 @@ func (r *MemcachedReconciler) newDeploymentForMemcached(m *cachev1alpha1.Memcach
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "memcached",
-							Image: "memcached:1.6.26-alpine",
+							Name:  memcached,
+							Image: memcachedImage,
 							Ports: []corev1.ContainerPort{
-								{ContainerPort: 11211},
+								{ContainerPort: memcachedPort, Name: memcached},
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("50m"),
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("250m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(memcachedPort)},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(memcachedPort)},
+								},
+								InitialDelaySeconds: 15,
+								PeriodSeconds:       20,
 							},
 						},
 					},
@@ -209,66 +293,35 @@ func (r *MemcachedReconciler) newDeploymentForMemcached(m *cachev1alpha1.Memcach
 			},
 		},
 	}
-	// 设置OwnerReference，级联删除
 	if err := ctrl.SetControllerReference(m, dep, r.Scheme); err != nil {
-		log.Log.Error(err, "SetControllerReference error")
+		log.FromContext(ctx).Error(err, "Failed to set controller reference")
+		return nil, fmt.Errorf("set controller reference: %w", err)
 	}
-	return dep
+	return dep, nil
 }
 
-// newSubResourceForMemcached 构造子资源ConfigMap，OwnerReference设BlockOwnerDeletion=true，并带finalizer
-func (r *MemcachedReconciler) newSubResourceForMemcached(m *cachev1alpha1.Memcached) *corev1.ConfigMap {
+// newConfigMapForMemcached 创建附属ConfigMap，绑定ownerReference
+func (r *MemcachedReconciler) newConfigMapForMemcached(ctx context.Context, m *cachev1alpha1.Memcached) (*corev1.ConfigMap, error) {
+	labels := map[string]string{
+		"app":          "memcached",
+		"memcached_cr": m.Name,
+	}
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      m.Name + "-sub",
+			Name:      m.Name,
 			Namespace: m.Namespace,
-			// 给子资源加finalizer，演示删除阻塞
-			Finalizers: []string{subResourceFinalizer},
+			Labels:    labels,
 		},
 		Data: map[string]string{
-			"owner": m.Name,
-			"note":  "BlockOwnerDeletion demo",
+			"memcached.conf": "max_memory=128m\n",
 		},
 	}
-	// 自动设置 Controller=true 且 BlockOwnerDeletion=true
+	// 设置属主引用，自动controller=true, blockOwnerDeletion=true
 	if err := ctrl.SetControllerReference(m, cm, r.Scheme); err != nil {
-		// 正常不会失败，忽略即可
-		log.Log.Error(err, "Failed to add finalizer")
+		log.FromContext(ctx).Error(err, "Failed to set controller reference for configmap")
+		return nil, fmt.Errorf("set controller reference cm: %w", err)
 	}
-	return cm
-}
-
-func removeString(list []string, s string) []string {
-	result := make([]string, 0, len(list))
-	for _, v := range list {
-		if v != s {
-			result = append(result, v)
-		}
-	}
-	return result
-}
-
-// setCondition 维护condition，避免重复添加同类型condition
-func (r *MemcachedReconciler) setCondition(m *cachev1alpha1.Memcached, condType string, status metav1.ConditionStatus, reason, msg string) {
-	newCond := metav1.Condition{
-		Type:               condType,
-		Status:             status,
-		Reason:             reason,
-		Message:            msg,
-		LastTransitionTime: metav1.Now(),
-	}
-	foundIdx := -1
-	for i, c := range m.Status.Conditions {
-		if c.Type == condType {
-			foundIdx = i
-			break
-		}
-	}
-	if foundIdx >= 0 {
-		m.Status.Conditions[foundIdx] = newCond
-	} else {
-		m.Status.Conditions = append(m.Status.Conditions, newCond)
-	}
+	return cm, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

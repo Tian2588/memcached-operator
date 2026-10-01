@@ -4,6 +4,22 @@ metadata:
   labels:
     app.kubernetes.io/name: memcached-operator
     app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/instance: memcached-sample
   name: memcached-sample
 spec:
   size: 3
+---
+# Companion ConfigMap for memcached-sample.
+# Do not set ownerReferences here: the parent UID is assigned only after the CR is created.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/name: memcached-operator
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/instance: memcached-sample
+    app.kubernetes.io/component: subresource
+  name: memcached-sample
+data:
+  owner: memcached-sample
+  note: Sample subresource for memcached-sample
